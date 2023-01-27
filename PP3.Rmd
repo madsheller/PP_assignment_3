@@ -1,0 +1,847 @@
+---
+title: "PP - Assignment 3"
+author: "Mads Øhlenschlæger Heller // fpg820"
+output:
+  pdf_document: default
+  word_document: default
+---
+
+```{r warning=F, message=F, echo=FALSE}
+library(ppstat)
+library(tidyverse)
+library(gridExtra)
+```
+
+```{r echo=FALSE}
+set.seed(1)
+```
+
+
+```{r helper functions, echo=FALSE}
+simulate_events <- function(alpha=1, beta=1, gamma=1.1, rho=1e-4, K=1000, t=50) {
+  M <- rpois(1, t*K)
+  X <- sort(runif(M, 0, t))
+  U <- runif(M, 0, K)
+  
+  n <- 0
+  h <- 0
+  x0 <- 0
+  
+  events <- numeric(M)
+  lam_seq <- numeric(M)
+  Lam_seq <- numeric(M)
+  
+  for(k in seq_len(M)) {
+    x1 <- X[k]
+    s <- x1-x0
+    lam <- max(1-rho*n, 0) * (beta + exp(-gamma*s)*h)
+    LamDiff <- max(1-rho*n, 0) * (beta*s + h*(1-exp(-gamma*s))/gamma) 
+    if (U[k] <= lam) {
+      n <- n + 1
+      lam_seq[n] <- lam
+      Lam_seq[n] <- LamDiff
+      events[n] <- x1
+      h <- exp(-gamma*s)*h + alpha
+      x0 <- x1
+    }
+  }
+  return(
+    list(
+      t = events[seq_len(n)],
+      lambda = lam_seq[seq_len(n)],
+      Lambda = Lam_seq[seq_len(n)]
+    )
+  )
+}
+
+compute_rho <- function(alpha, gamma, Tim){
+  N <- length(Tim)
+  rho <- numeric(N+1)
+  rho[2] <- alpha
+  if (N==1){
+    return(rho)
+  }
+  for (k in 2:N){
+    rho[k+1] <- exp(-gamma*(Tim[k]-Tim[k-1]))*rho[k]+alpha
+  }
+  return(rho)
+}
+
+lambda_self <- function(t, T1, alpha=1, beta=1, gamma=1.1, rho=1e-4, hist=FALSE, rho_tim){
+  if (t<=T1[1]){
+    beta
+  }
+  else{
+    Tim <- T1[T1<=t]
+    h <- tail(compute_rho(alpha, gamma, rho_tim), length(Tim)+1)
+    T0 <- c(tail(rho_tim, length(T1)-1)[1],Tim[1:length(Tim)-1])
+    Nt_minus <- tail(seq_along(rho_tim)-1, length(Tim))
+    lam <- beta + exp(-gamma*(Tim-T0))*h[1:length(h)-1]
+    lam <- (1-rho*Nt_minus)*lam
+    if (hist==TRUE){
+      return(lam)
+    }
+    return(lam[length(lam)])
+  }
+}
+
+Lambda <- function(t, T1, alpha=1, beta=1, gamma=1.1, rho=1e-4, rho_tim) {
+  if (t<T1[1]){
+    beta*t
+  }
+  else{
+    Tim <- T1[T1<=t]
+    Tim <- rho_tim
+    h <- compute_rho(alpha, gamma, Tim)
+    N <- length(Tim)
+    Lam <- numeric(N)
+    Lam[1] <- beta*Tim[1]
+    if(N==1){
+      return(Lam + (1-rho)*(beta*(t-T[N]) + h[N]*(1-exp(-gamma*(t-Tim[N])))/gamma))
+    }
+    for (k in 2:N){
+      s <- Tim[k]-Tim[k-1]
+      Lam[k] <-  Lam[k-1] + (1-rho*k)*(beta*s + h[k-1]*(1-exp(-gamma*s))/gamma)
+    }
+    add <- beta*(t-Tim[length(Tim)]) + h[length(h)]*(1-exp(-gamma*(t-Tim[length(Tim)-1])))/gamma
+    if (length(T1) < length(rho_tim)){
+      return(Lam[N] + (1-rho*N)*add - Lam[N-length(T1)])
+    }
+    else{
+      return(Lam[N] + (1-rho*N)*add)  
+    }
+  }
+}
+
+
+minus_log_lik <- function(parm, T1, Tmax, est_rho=FALSE, rho_then=1e-4, supp=Tmax) {
+  a <- parm[1]
+  b <- parm[2]
+  c <- parm[3]
+  r <- rho_then
+  if (est_rho==TRUE){
+    r <- parm[4]
+  }
+  
+  if (Tmax<T1[1]){
+    Lambda(Tmax,T1, alpha = a, beta = b, gamma = c, rho = r, rho_tim = T1)
+  }
+  else{
+    Tim <- T1[T1<=Tmax]
+    Tim <- Tim[Tim>=Tmax-supp]
+    lam_seq <- lambda_self(t=Tmax, T1=Tim, alpha = a, beta = b, gamma = c, rho=r, hist = TRUE, rho_tim=T1)
+    log_lam <- sum(log(lam_seq)[1:length(lam_seq)-1])
+    Lam <- Lambda(t=Tmax, T1=Tim, alpha = a, beta = b, gamma = c, rho=r, rho_tim = T1)
+    return(Lam - log_lam)
+  }
+}
+
+grad_mll_seq <- function(parm, T1, Tmax, est_rho=FALSE, rho_then=1e-4) {
+  a <- parm[1]
+  b <- parm[2]
+  c <- parm[3]
+  r <- rho_then
+  if (est_rho==TRUE){
+    r <- parm[4]
+  }
+  
+  grad_seq <- matrix(numeric(length(T1)*3), nrow=3)
+  grad_seq[,1] <- c(1/c, T1[1], a/(c*c))
+  
+  for (i in 2:length(T1)){
+    tmax <- T1[i]
+    T2 <- T1[T1<=tmax]
+    Nt <- length(T2)
+    I <- numeric(Nt)
+    for (k in 2:Nt){
+      I[k] <- sum(exp(-c*(T1[k]-T1[1:k-1])))
+    }
+    
+    ga1 <- sum((I/(b+a*I)))
+    ga2 <- Nt/c
+    ga3 <- I[Nt]/c
+    ga <-  ga1 - ga2 - ga3
+    
+    gb <-  sum((1/(b + a*I))) - tmax
+    
+    II <-  numeric(Nt)
+    for (k in 2:Nt){
+      II[k] <-  sum((T2[k]-T2[1:k-1])*exp(-c*(T2[k]-T2[1:k-1])))
+    }
+    
+    gc1 <- (a/c) * sum((tmax - T2) * exp(-c*(tmax-T2)))
+    gc2 <- (a/(c*c)) * (Nt-I[Nt])
+    gc3 <- a * sum(II/(b + a*I))
+    gc <- -gc1 + gc2 - gc3
+    
+    grad_seq[,i] = c(ga, gb, gc)
+  }
+  
+  return(grad_seq)
+}
+
+
+grad_mll <- function(parm, T1, Tmax, est_rho=FALSE, rho_then=1e-4, supp=Tmax) {
+  a <- parm[1]
+  b <- parm[2]
+  c <- parm[3]
+  r <- rho_then
+  if (est_rho==TRUE){
+    r <- parm[4]
+  }
+  Tim <- T1
+  T1 <- T1[T1<=Tmax]
+  T1 <- T1[T1>=Tmax-supp]
+  
+  Nt <- length(T1)
+  I <- numeric(Nt)
+  for (k in 2:Nt){
+    I[k] <- sum(exp(-c*(T1[k]-T1[1:k-1])))
+  }
+  
+  ga1 <- sum((I/(b+a*I)))
+  ga2 <- Nt/c
+  ga3 <- I[Nt]/c
+  ga <-  ga1 - ga2 - ga3
+  
+  gb <-  sum((1/(b + a*I))) - Tmax
+  
+  II <-  numeric(Nt)
+  for (k in 2:Nt){
+    II[k] <-  sum((T1[k]-T1[1:k-1])*exp(-c*(T1[k]-T1[1:k-1])))
+  }
+  
+  gc1 <- (a/c) * sum((Tmax - T1) * exp(-c*(Tmax-T1)))
+  gc2 <- (a/(c*c)) * (Nt-I[Nt])
+  gc3 <- a * sum(II/(b + a*I))
+  gc <- -gc1 + gc2 - gc3
+  
+  lam_seq <- lambda_self(t=Tmax, T1 = T1 , alpha = a, beta = b, gamma = c, rho=0, hist=TRUE, rho_tim = Tim)
+  lam_seq0 <- lam_seq[1:length(lam_seq)-1]
+  lam_seq <- lam_seq[2:length(lam_seq)]
+  Nt_seq <- seq_along(T1)[1:length(T1)-1]
+  
+  gd <- 0
+  
+  if (r>0){
+    gd1 <- r*sum(Nt_seq*(lam_seq-lam_seq0))
+    gd2 <- sum(Nt_seq/(Nt_seq-1/r))
+    
+    gd <- gd1 + gd2
+  }
+  
+  
+  grad_seq <- grad_mll_seq(parm, T1 = T1, Tmax = Tmax, est_rho=est_rho)
+  grad_seq0 <- grad_seq[,1:ncol(grad_seq)-1]
+  grad_seq <- grad_seq[,2:ncol(grad_seq)]
+  Nt_seq <- seq_along(T1)[length(T1)-1]
+  add_term <- r*rowSums(Nt_seq*(grad_seq-grad_seq0))
+  
+  -c(ga, gb, gc, gd) + c(add_term, 0)
+}
+
+```
+
+
+
+All code used in the assignment can be found on my [Github repository](https://github.com/madsheller/PP_assignment_3.git). The code is not commented.
+
+https://github.com/madsheller/PP_assignment_3.git
+
+
+# Part I
+
+## Problem 1
+
+We consider the model considered in the paper by Rizoiu et al. given by setting $g(t)=1$ and $\varphi(x)=x$
+
+$$
+  \lambda_t = (1-\rho N_{t-})_+ \left(\beta + \alpha\int_0^{t-} e^{-\gamma(t-s)}dN_s\right) =: Y_t\tilde\lambda_t,
+\label{}
+$$
+
+where for ease of notation we define $Y_t = (1-\rho N_{t-})$ and $\tilde\lambda_t = \left(\beta + \alpha\int_0^{t-} e^{-\gamma(t-s)}dN_s\right)$, which is also convenient for relations to exercise 6.4 where we considered $\tilde\lambda_t$. Throughtout we will assume that all parameters are positive.
+
+Regardless of the choice of $g$ we have that $\lambda_t \leq \tilde\lambda_t$. In fact, the process $Y$ serves as a way of limiting the population size and if $N$ is non-exploding this makes the counting process $N$ finite. Other choices of $g$ will control the speed of the decay rate, but the image of $g$ is positive so the intensity will never allow momentary increasing rates, e.g. seasonal effects.
+
+In our case, non-explosion follows directly as the counting process associated with $\tilde\lambda_t$ is non-exploding. Furthermore, the stability condition $\alpha < \gamma$ carries over as well. We may also conclude that any $\varphi$ bounded by $x\mapsto x$ defines a non-exploding counting process.
+
+Since $Y_0=1$ and $\lambda_0=\tilde\lambda_0$ we can initialize a simulation of $N$ using the algorithm in exercise 6.4 and iteratively scale $\tilde\lambda$ with a factor of $Y_{T_k}$ at any event $k$.
+
+
+```{r Simulate from lambda, echo=FALSE, warning=FALSE, fig.height=3.5}
+label = matrix(c(0.3, 1,
+                 0.1, 1), byrow = F, ncol=2)
+
+
+
+label = matrix(rep(1,4), ncol=2)
+
+plotDF <- data.frame("alpha" = c(),
+                     "N" = c(),
+                     "lambda" = c(),
+                     "rep" = c())
+
+repn <- 0
+
+for(i in 1:2){
+  for (j in 1:2){
+    repn <- repn + 1
+    #sim <- simulate_events(7,1, 16, 1e-3, 10000, 100)  %>% 
+    sim <- simulate_events(label[i,j], label[i,j], 1.1, 1e-3, 10000, 150)  %>% 
+    as.data.frame() %>% 
+    mutate(N = seq_along(t)) %>% 
+    mutate(rep = repn) %>% 
+    select(t, N, lambda, rep)
+  plotDF <- rbind(plotDF, sim)
+  }
+}
+
+ggplot(plotDF, aes(x=t, color=factor(rep))) +
+  geom_line(aes(y=lambda), size = 0.3) +
+  geom_line(aes(y=N / 20)) +
+  
+  scale_y_continuous(
+    name = "lambda",
+    sec.axis = sec_axis(~.*20, name="N")
+  ) +
+  theme(legend.position = "none")#+
+  #geom_hline(yintercept = 1/1e-3/20, linetype = "dashed")
+```
+
+From the simulations we see the self-exciting nature of the process and how the limiting process $Y$ surpresses the intensity as more events are realised. To get a grasp of the róle of the parameters it is more useful to look at the recurrence relation.
+
+In exericse 3.5 we wrote 
+$$
+  \tilde\lambda_t = \beta +  e^{-\gamma(t-T_k)}\tilde\rho_k.
+$$
+(OBS: $\tilde\rho_k$ is $\rho_k$ from exercise 3.5). 
+
+As in exercise 3.5 we define generally
+$$
+  h_k = \alpha\int_0^{T_k} e^{-\gamma(T_k-s)} dN_s 
+  = \varphi^{-1}\left(\frac{\lambda_{T_k+}}{(1-\rho N_{T_k})_+}1(N_{T_k} <\rho^{-1})-\beta\right).
+$$
+
+The steps required to find the recursive formula for $\tilde\rho_k$ depends only the filter function. Thus, we find a recursive relation on the same form
+$$
+  h_0=0, \quad h_k = e^{-\gamma(T_k-T_{k+1})}h_{k-1} + \alpha, \quad t\in(T_k, T_{k+1}].
+$$
+
+Using this, we can for any $t\in(T_k, T_{k+1}]$ write the intensity as
+$$
+  \lambda_t = (1-\rho k)\left(\beta + e^{-\gamma(t-T_k)}h_k\right).
+$$
+From here we see that $\beta$ is a baseline intensity that most importantly ensures that $\lambda$ is positive at time 0. The self-exciting behavior is seen from the $\gamma$ term, that creates a decreasing trend in the intensity if the interevent times increases. At last, $\alpha$ controls how fast $\lambda$ increases in $t$. The above formula may also provide itself useful for moment calculations utilizing the corresponding martingale.
+
+When $N$ is non-exploding we can find a compensator $\Lambda$ such that $M=N-\Lambda$ is a martingale. Having access to the compensator is useful especially for estimation. The compensator $\Lambda$ of $N$ is for any $t\geq0$
+$$
+  \Lambda_t =\int_0^t\lambda_s ds =\int_0^t Y_s\tilde\lambda_s ds = (Y \bullet\tilde\Lambda)_t.
+$$
+
+It may be useful to partition the interval according to the interevent times
+
+$$
+  \Lambda_t = \int_0^t \lambda_\tau d\tau = \int_{T_k}^{T_k+s}\lambda_\tau d\tau + \sum_{i=0}^{k-1}\int_{T_i}^{T_{i+1}}\lambda_\tau d\tau 
+  = (\Lambda_{T_k+s}-\Lambda_{T_k}) + \sum_{i=0}^{k-1}(\Lambda_{T_{i+1}}-\Lambda_{T_i}), \quad s\in[0,S_{k+1}),
+$$
+with the convention $T_0=0$. Since $N_{t-}=k$ on the interval $(T_k, T_k+s]$ we have that 
+
+$$
+  \Lambda_{T_k+s}-\Lambda_{T_k} = \int_{T_k}^{T_k+s} (1-\rho k)_+ \tilde\lambda_\tau d\tau
+  = (1-\rho k)_+(\tilde\Lambda_{T_k+s}-\tilde\Lambda_{T_k}).
+$$
+
+An expression for $\tilde\Lambda_{T_k+s}-\tilde\Lambda_{T_k}$ is given in exercise 4.5. Continuity of $\Lambda$ implies that $\Lambda_{T_{k+1}}=\Lambda_{T_{k+1}-}$, so we can use the formula for evaluating the above sum as well. Hence, all the quantities involved in simulating $N$ can be used to compute $\Lambda$ as well.
+
+
+```{r Martingale plot, echo=FALSE, cache=TRUE}
+alpha <- 1
+beta <- 1
+gamma <- 1.4
+rho <- 1e-4
+K <- 1000
+Tmax <- 100
+
+B <- 100
+biGN <- length(simulate_events(alpha, beta, gamma, rho, K, Tmax)$t)*2
+MG_mat <- matrix(0, nrow = biGN, ncol = B)
+for(b in 1:B) {
+  sim <- simulate_events(alpha, beta, gamma, rho, K, Tmax)
+  N <- seq_along(sim$t)
+  L <- cumsum(sim$Lambda)
+  M <- N-L
+  lst <- length(M)
+  fill <- rep(M[lst], biGN-lst)
+  M <- c(M,fill)
+  MG_mat[, b] <- M
+}
+
+grid <- seq(0,Tmax, length.out =  biGN)
+matplot(grid, MG_mat, type = "l", lty = 1,
+        col = rgb(0.5, 0.5, 0.5, 0.2), xlim = c(0,65),
+        ylab = "M", xlab="t",
+        main = "100 simulations of M")
+lines(grid, rowMeans(MG_mat), col = "red")
+rm(MG_mat)
+```
+
+The red line shows the mean process of the grey trajectories. Interestingly, the processes that are less compensated seems to live longer (and it seems to be linked to $\beta$).
+
+
+## Problem 2
+
+Assume that $\rho>0$ is known and the observation window $[0,t]$ is chosen such that $N_t< \rho$. It's convienient to cut off the observation window at the last observation, $t=T_{N_t}$ say. For esimtation of $\theta= (\alpha, \beta, \gamma)^t$ we will use the estimating equation
+$$
+  (\psi(\theta) \bullet M(\theta))_t = 0.
+$$
+
+We mainy have two choices of $\psi$, namely the score and the quadratic contrast.
+
+Choosing $\psi(\theta)=\nabla\lambda(\theta)/\lambda(\theta)$ gives the score equation
+
+$$
+  \nabla\lambda(\theta) = \left(1-\rho\int_0^tg(t-s)dN_s\right)\nabla\varphi(\tilde\lambda(\theta))
+  = \left(1-\rho\int_0^tg(t-s)dN_s\right)\varphi'(\tilde\lambda(\theta))\nabla(\tilde\lambda(\theta)).
+$$
+
+The choice of $g$ doesn't change the behavior of this gradient and with $g(t)=1$ we have
+
+$$
+  \psi(\theta) = \frac{-\nabla\lambda(\theta)}{\lambda(\theta)} 
+  = \frac{-Y_t\nabla\varphi(\tilde\lambda(\theta))}{Y_t\varphi(\tilde\lambda(\theta))}
+  =\frac{-\varphi'(\tilde\lambda(\theta))\nabla\tilde\lambda(\theta)}{\varphi(\tilde\lambda(\theta))} 
+  = -\left(\log\varphi(\tilde\lambda(\theta))\right)'\nabla\tilde\lambda(\theta),
+$$
+
+where the gradient on the right hand side is computed in exercise 6.4. Choosing e.g. $\varphi=\exp(x)$ gives a nice score equation. When $\varphi(x)=x$ the score equation becomes
+$$
+  0 = (Y\nabla\tilde\lambda(\theta)\bullet\ell)_t - \left(\frac{\nabla\tilde\lambda(\theta)}{\tilde\lambda(\theta)}\bullet N\right)_t
+  =  - \rho(N_{-}\nabla\tilde\lambda(\theta)\bullet\ell)_t + (\nabla\tilde\lambda(\theta)\bullet\ell)_t - \left(\frac{\nabla\tilde\lambda(\theta)}{\tilde\lambda(\theta)}\bullet N\right)_t.
+$$
+This means that we get the estimating equations by simply adding a term to the score equations
+$$
+  \int_0^t N_{s-} \nabla\tilde\lambda_s(\theta) ds = \sum_{k=1}^{N_t-1}k\int_{T_{k}}^{T_{k+1}}\nabla\tilde\lambda_s(\theta) ds
+  = \sum_{k=1}^{N_t-1}k\left( (\nabla\tilde\lambda(\theta)\bullet\ell)_{T_{k+1}}- (\nabla\tilde\lambda(\theta)\bullet\ell)_{T_{k}} \right).
+$$
+We need to be able to compute the gradient at every $T_k$, which is computable though computationally heavy. We might spare computational time by not including the full history back to time 0, but rather choose a lower bound on the integral. Going back to the intial simulations one might argue that most of the information of $\lambda$ is contained the first phase of the history. In any case these phases are linked via the recurrence relation.
+
+Instead of solving the score equation numerically, we can utilize that the score equations is minus the gradient of the log-likelihood to implement a gradient based optimization algorithm. At the exercises we saw how gradient based optimization is superior to generic optimization of the log-likehood alone. In `R` this can be done by feeding the score equations as the gradient in `optim` and specify an optimization method. Since we have parameter constraints it's natural to use `method=L-BFGS-B`. 
+
+If we were to observe $N$ repeatedly we would expect that the estimators on average is equal to the true parameters. Asymptotically, it follows from the martingale CLT that $\hat\theta$ is normally distributed with covariance matrix $(tK_t)^{-1}$ when the estimating equation is the score equation. The catch is, that the martingale CLT holds when the true intensity comes from the parametrized family of intensities for some $\theta_0$. When doing simulation this is easy to control, but in practice we will not have this guarantee. 
+
+For the covariance matrix we can draw on the results from exercise 6.4 since
+$$
+  K_t = E\left(\psi(\theta_0)^{\otimes2}\bullet\Lambda(\theta_0)\right)_t
+  = E\left(\tilde\psi(\theta_0)^{\otimes2}\bullet\Lambda(\theta_0)\right)_t
+  = E\left(\tilde\psi(\theta_0)^{\otimes2}\bullet N\right)_t.
+$$
+
+A natural estimator is obtained by replacing $\theta_0$ and $t$ with their respective emperical versions. The advantage on the right hand side is that we don't have to take $\rho$ into account. It makes sense that with $\rho$ being known, it should only affect the variance through observing $N$. When introducing $\rho$ as a parameter $\tilde\psi\leadsto(\tilde\psi,\partial_\rho\lambda/\lambda)$
+
+To see how the estimation procedures perform we consider a simulation study, where 1000 observations of $N$ is simulated all on the interval [0,100] with $\rho=10^{-5}$ and the estimation is done on [70, 100]. The generic optimization fails with added support, but since the computational problem lies in the gradient we are satisfied by optimizing over the whole history in this case. The purple line marks the true parameter values.
+
+
+```{r MLE sim, cache = TRUE, echo=FALSE, warning=FALSE, message=FALSE, fig.height=3.5}
+B <- 1000
+theta_generic <- matrix(numeric(B*3), ncol=3)
+theta_grad <- matrix(numeric(B*3), ncol=3)
+
+r <- 1e-6
+parms <- c(5, 0.5, 11.1, r)
+tmax <- 100
+
+
+for (i in 1:B){
+  sim <- simulate_events(parms[1], parms[2], parms[3], rho=parms[4], t=tmax)
+  parm <- parms + c(runif(3,0.5,2),0)
+  theta_generic[i,] <- optim(
+    par = parm, 
+    fn = minus_log_lik,
+    method = "L-BFGS-B",
+    lower = rep(1e-12,3),
+    upper = rep(1e3,3),
+    hessian = T,
+    Tmax = tmax,
+    T1 = sim$t,
+    est_rho = FALSE,
+    rho_then = r,
+    supp = tmax
+  )$par[1:3]
+  
+  theta_grad[i,] <- optim(
+    par = parm, 
+    fn = minus_log_lik, 
+    gr = grad_mll,
+    lower = rep(1e-8,3),
+    upper = rep(1e3,3),
+    method = "L-BFGS-B",
+    control = list(pgtol = 1e-8, factr = 1e-8),
+    hessian = TRUE,
+    Tmax = tmax,
+    T1 = sim$t,
+    est_rho = FALSE,
+    rho_then = r,
+    supp=30
+  )$par[1:3]
+}
+
+theta_generic <- as.data.frame(cbind(rep("generic", B), theta_generic))
+names(theta_generic) <- c("method", "alpha", "beta", "gamma")
+theta_grad <- as.data.frame(cbind(rep("gradient", B), theta_grad))
+names(theta_grad) <- c("method", "alpha", "beta", "gamma")
+
+theta_gg <- rbind(theta_generic, theta_grad) %>% 
+  group_by(method) %>% 
+  pivot_longer(cols = c("alpha", "beta", "gamma"), values_to = "value", names_to = "parm") %>% 
+  mutate(value = as.numeric(value))
+
+
+ggplot(theta_gg, aes(x=value, color=method)) +
+  geom_histogram(fill = "white", alpha=0.45, position="identity") +
+  geom_vline(data = data.frame(parm = c("alpha", "beta", "gamma"), means = parms[1:3]), 
+             mapping = aes(xintercept = means),
+             col="purple", lty = "dashed", size=0.74)+
+  facet_grid(.~parm, scales = "free") +
+  labs(x = "", y = "") +
+  theme_bw()
+```
+
+
+Their seems to be a positive bias, especially for the $\gamma$ estimator. When we don't include the whole history, we do not get a proper estimate of $\beta$ which is not too surprising as $\lambda_0=\beta$. This is also clear from the generic optimization. The accuracy of the other two parameters are surprisingly good given that we only include the latest 30\% of the time points. I have also been running these simulations over the whole history (it takes a long time!) and here $\beta$ is on average closer to the true value, but the picture for $\alpha$ and $\gamma$ is not much different.
+
+
+```{r echo=FALSE, eval=FALSE, warning=FALSE}
+mean_vec <- theta_gg %>% 
+  filter(method=="gradient") %>% 
+  group_by(parm) %>% 
+  select(c(parm, value)) %>% 
+  mutate(value = as.numeric(value)) %>%
+  summarise(mean = mean(value)) %>% 
+  select(mean)
+
+
+cor_grad <- theta_grad %>% 
+  select(-method) %>% 
+  mutate_if(is.character, as.numeric) %>% 
+  cov() %>% 
+  sqrt()
+
+c(mean_vec - 1.96*as.numeric(diag(cor_grad)), mean_vec, mean_vec + 1.96*as.numeric(diag(cor_grad)))
+```
+
+
+
+```{r echo=FALSE, eval=FALSE}
+mean_vec <- theta_gg %>% 
+  filter(method=="generic") %>% 
+  group_by(parm) %>% 
+  select(c(parm, value)) %>% 
+  mutate(value = as.numeric(value)) %>%
+  summarise(mean = mean(value)) %>% 
+  select(mean)
+
+
+cor_generic <- theta_generic %>% 
+  select(-method) %>% 
+  mutate_if(is.character, as.numeric) %>% 
+  cov() %>% 
+  sqrt()
+
+c(mean_vec - 1.96*as.numeric(diag(cor_generic)), mean_vec, mean_vec + 1.96*as.numeric(diag(cor_generic)))
+```
+
+
+
+## Problem 3
+
+We know turn to the case of unkown $\rho$ that needs to be estimated. Interpreting $\rho^{-1}$ as a population size it can quite naturally be known a priori, but for datasets like Obama and Joe it may not be obvious what a sensible population size. In fact, data might e.g. suggest that the number of blog posts isn't finite such that it makes sense to set $\rho=0$.
+
+To estimate $\rho$ we extend the estimating equations from problem 2 with an equation involving the derivative wrt. $\rho$. To this end, note that
+$$
+  \partial_\rho\lambda_t(\theta) = -\rho \int_0^tg(t-s)N_{s-} \varphi(\tilde\lambda_t(\theta))
+  = - \rho N_{t-}\tilde\lambda(\theta).
+$$
+
+The new terms in the estimating equation are then
+$$
+\begin{aligned}
+  \left(\partial_\rho \lambda(\theta)\bullet\ell\right)_t 
+  &= -\rho\int_0^tN_{s-}\tilde\lambda_s(\theta)ds
+  = -\rho\sum_{k=1}^{N_t-1}k (\tilde\lambda_{T_{k+1}}(\theta)-\tilde\lambda_{T_k}(\theta)), \\
+  \left(\frac{\partial_\rho \lambda(\theta)}{\lambda(\theta)}\bullet N\right)_t 
+  &= \left(\frac{- \rho N_{-}\tilde\lambda(\theta)}{Y\tilde\lambda(\theta)}\bullet N\right)_t 
+  = -\rho\left(\frac{- \rho N_{-}}{1-\rho N_{-}}\bullet N\right)_t 
+  = \sum_{k=1}^{N_t-1} \frac{k}{k-\rho^{-1}}.
+\end{aligned}
+$$
+
+One advantage of using the score equation is that we can perform likelihood-ratio test. I.e. under $H_0:\rho=0$ we have that
+$2(l_t(\hat\theta)) - l_t(\hat\theta_0))$ is approximately $\chi^2_3$ distributed. As we have the likelihood function readily availabe, this is just a matter of fitting $\lambda$ with $\rho$ estimation and fitting $\tilde\lambda$, compute the test statisctic and the corresponding p-value where larger values are critical.
+
+```{r MLE with rho sim, cache = TRUE, echo=FALSE, warning=FALSE, message=FALSE, fig.height=3.5}
+B <- 1000
+theta_generic <- matrix(numeric(B*4), ncol=4)
+theta_grad <- matrix(numeric(B*4), ncol=4)
+
+r <- 1e-6
+parms <- c(5, 0.5, 11.1, r)
+tmax <- 100
+
+
+for (i in 1:B){
+  sim <- simulate_events(parms[1], parms[2], parms[3], rho=parms[4], t=tmax)
+  parm <- parms + c(runif(3,0.5,2), 1e-5)
+  theta_generic[i,] <- optim(
+    par = parm, 
+    fn = minus_log_lik,
+    #method = "L-BFGS-B",
+    #lower = rep(1e-9,4),
+    #upper = rep(1e3,4),
+    hessian = T,
+    Tmax = tmax,
+    T1 = sim$t,
+    est_rho = TRUE,
+    rho_then = r,
+    supp=tmax
+  )$par
+  
+  theta_grad[i,] <- optim(
+    par = parm, 
+    fn = minus_log_lik, 
+    gr = grad_mll,
+    lower = rep(1e-12,4),
+    upper = rep(1e3,4),
+    method = "L-BFGS-B",
+    control = list(pgtol = 1e-8, factr = 1e-8),
+    hessian = TRUE,
+    Tmax = tmax,
+    T1 = sim$t,
+    est_rho = TRUE,
+    rho_then = r,
+    supp=30
+  )$par
+}
+
+theta_generic <- as.data.frame(cbind(rep("generic", B), theta_generic))
+names(theta_generic) <- c("method", "alpha", "beta", "gamma", "rho")
+theta_grad <- as.data.frame(cbind(rep("gradient", B), theta_grad))
+names(theta_grad) <- c("method", "alpha", "beta", "gamma", "rho")
+
+theta_gg <- rbind(theta_generic, theta_grad) %>% 
+  group_by(method) %>% 
+  pivot_longer(cols = c("alpha", "beta", "gamma", "rho"), values_to = "value", names_to = "parm") %>% 
+  mutate(value = as.numeric(value))
+
+
+ggplot(theta_gg, aes(x=value, color=method)) +
+  geom_histogram(fill = "white", alpha=0.45, position="identity") +
+  geom_vline(data = data.frame(parm = c("alpha", "beta", "gamma", "rho"), means = parms[1:4]), 
+             mapping = aes(xintercept = means),
+             col="purple", lty = "dashed", size=0.74)+
+  facet_grid(.~parm, scales = "free") +
+  labs(x = "", y = "") +
+  theme_bw()
+```
+
+The $\rho$ estimates are good to a point where I am afraid if I have passed the true $\rho$ to the gradient somehow. 
+
+While hypothesis test is seemingly easy, we lack a measure of how well the model fits the data. Having done estimation through the score equation it is easy to compute TIC values, yet this is only good for comparing models and not assess whether any of our models are sensible in the first place.
+
+A more practical approach is to simulate from the fitted model and compare with the observed. This works best if we can compute statistics based on of observing the simulations and compare to the observed value. If the purpose of the model is to predict the final count - or simply the count at a future timepoint - one might estimate parameters at a cutoff time and compare the limit model with the observed endpoint. This could also be extended to a monitoring of how the estimation changes with changing endpoints.
+
+
+# Part II
+
+In this part we will consider the Joe dataset. Initially, we can fit a model to the data in two ways. We can either consider the dataset as a whole or we may assume independent counting processes for each url. With the latter approach we can train the model on a subset of the data and see how it performs as a function of time on the remaining.
+
+
+
+```{r data, echo=F}
+joe <- read.csv("~/Documents/PP/joe.csv", sep="", colClasses = c("integer", "factor"))
+obama <- read.csv("~/Documents/PP/obama.csv", sep="", colClasses = c("integer", "factor"))
+
+joe1 <- subset(joe, url %in% c("myspace.com", "yahoo.com"))
+joe1$time <- log(joe1$time)
+```
+
+
+We first fit the SIR model that we considered in part I. Because the loglikelihood values are numerically too large the fitting is done on `log(time)`. I don't think that the counting process is invariant under time transformation, so I am not sure wheter I should then consider what happens with $\lambda_{\log t}$ then. Maybe a flat scaling had been better, e.g. the standard deviation? Do we get log(times) when simulating from the fitted model? 
+
+The implementation of the gradient is computationally heavy, so we only fit the model on the top 2 urls (Myspace and Yahoo) which accounts for around 15.63\% of the dataset. Support is set is chosen such that the time is cutoff at the empirical 75\% quantile.
+
+```{r echo=F, eval=F}
+ggplot(joe1, aes(x = time, y = seq_along(time))) +
+  geom_line()
+```
+
+
+```{r fit SIR, echo=FALSE, cache=TRUE}
+r <- 1e-5
+parm <- c(5,1,10,r)
+
+fit <- optim(
+    par = parm, 
+    fn = minus_log_lik, 
+    gr = grad_mll,
+    lower = rep(1e-12, 4),
+    upper = rep(1e3, 4),
+    method = "L-BFGS-B",
+    control = list(pgtol = 1e-8, factr = 1e-8),
+    hessian = TRUE,
+    Tmax = max(joe1$time),
+    T1 = joe1$time,
+    est_rho = TRUE,
+    rho_then = r,
+    supp = max(joe1$time)/4
+  )
+```
+
+
+
+
+```{r fit0 SIR, echo=FALSE, cache=TRUE}
+r <- 0
+parm <- c(5,1,10,r)
+
+fit0 <- optim(
+    par = parm, 
+    fn = minus_log_lik, 
+    gr = grad_mll,
+    lower = rep(1e-12,3),
+    upper = rep(1e3,3),
+    method = "L-BFGS-B",
+    control = list(pgtol = 1e-8, factr = 1e-8),
+    hessian = TRUE,
+    Tmax = max(joe1$time),
+    T1 = joe1$time,
+    est_rho = FALSE,
+    rho_then = r,
+    supp = max(joe1$time)/4
+  )
+```
+
+A log-likelihood ratio test under the hypothesis $H_0:\rho=0$ gives a p-value of
+
+```{r}
+1-pchisq(2*(fit$value-fit0$value), 3)
+```
+It is likely based on these data that $\rho=0$. Indeed, the full model also assigns $\rho$ to the boundary value $10^{-12}$ that I provided `optim`. The parameter estimates of the null model is
+
+```{r table2, echo=FALSE, message=FALSE, warnings=FALSE, results='asis'}
+tabl <- "
+| alpha | beta | gamma |
+|-------|------|-------|
+| 46.06 | 0.28 | 47.74 |
+"
+cat(tabl) 
+```
+
+Confidence intervals can be derived using the sandwich variance. To asses the fit we simulate from the fitted $N$ and overlay the plot with the observed. 
+
+
+```{r asses fit, echo=FALSE, cache=TRUE}
+par_est <- fit0$par[1:3]
+alpha <- par_est[1]
+beta <- par_est[2]
+gamma <- par_est[3]
+rho <- 0
+K <- 10000
+Tmax <- 200
+
+B <- 100
+biGN <- length(simulate_events(alpha, beta, gamma, rho, K, Tmax)$t)*10
+MG_mat <- matrix(0, nrow = biGN, ncol = B)
+for(b in 1:B) {
+  sim <- simulate_events(alpha, beta, gamma, rho, K, Tmax)
+  N <- seq_along(sim$t)
+  lst <- length(N)
+  fill <- rep(N[lst], biGN-lst)
+  N <- c(N,fill)
+  MG_mat[, b] <- N
+}
+
+grid <- seq(0,Tmax, length.out =  biGN)
+matplot(grid, MG_mat, type = "l", lty = 1,
+        col = rgb(0.5, 0.5, 0.5, 0.2), 
+        xlim = c(0,65), ylim = c(0,2000),
+        ylab = "M", xlab="t",
+        main = "100 simulations of the fitted model")
+lines(grid, rowMeans(MG_mat), col = "red")
+lines(grid, findInterval(grid, joe1$time), col="green")
+#rm(MG_mat)
+```
+
+The green curve is the observed, the red is the mean of the simulations. The fitted model doesn't seem to capture the data at all. Again tough, the green curve are the log transformed timestamps.
+
+
+## Using ppstat
+
+We will now try to fit a model with $\varphi(x)=\exp(x)$. To do this we first need convert data to a `MarkedPointProcess` object.
+
+```{r echo=T}
+temp <- markedPointProcess(joe1)
+```
+
+We use a `bSpline` to create a basis expansion of the exponential term.
+
+
+```{r eval=T}
+fitExp <- pointProcessModel(time ~ +const(time), #+bSpline(time, knots = seq(1,2.5,0.3)),
+                            data = temp,
+                            family = Hawkes("log"),
+                            support = 0.1
+)
+```
+
+
+```{r}
+fitExp
+```
+
+I don't seem to find anything sensible.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
